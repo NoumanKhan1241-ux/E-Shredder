@@ -124,7 +124,7 @@ fn erase(
             verify_zeroed(vol, t.runs, cs)?;
             println!("  stream {}: wiped and verified (all zero)", t.label);
         }
-        vol.dismount()?; // forget cached file data; the volume remounts on next access
+        let _ = vol.dismount(); // may already be dismounted by the --force fallback; ignore that
     }
     Ok(())
 }
@@ -133,13 +133,16 @@ fn main() {
     let raw: Vec<String> = env::args().collect();
     let pause_flag = raw.iter().any(|a| a == "--pause");
     let argv: Vec<String> = raw.into_iter().filter(|a| a != "--pause").collect();
-    let force = argv.iter().any(|a| a == "--force");
+
+    // Default: if the volume can't be locked (Explorer keeps handles on it), dismount it.
+    // --strict turns that off and fails with an error instead.
+    let force = !argv.iter().any(|a| a == "--strict");
 
     if argv.len() < 2 {
         eprintln!(
-            "Usage:\n  e-shredder <file> [--erase] [--yes] [--force]\n  \
-             e-shredder --install [--force] | --uninstall\n  \
-             e-shredder --scrub-record <drive>: <record number> [--force]"
+            "Usage:\n  e-shredder <file> [--erase] [--yes] [--strict]\n  \
+             e-shredder --install | --uninstall\n  \
+             e-shredder --scrub-record <drive>: <record number> [--strict]"
         );
         process::exit(1);
     }
@@ -147,7 +150,7 @@ fn main() {
     // Context-menu registration: per-user registry, no elevation needed
     match argv[1].as_str() {
         "--install" => {
-            match install(force) {
+            match install(false) {
                 Ok(cmd) => println!(
                     "Context menu entry installed.\nCommand: {cmd}\n\
                      Right-click a file (Windows 11: 'Show more options', or Shift+right-click)."
@@ -183,7 +186,7 @@ fn main() {
 
     // Cleanup mode: e-shredder --scrub-record X: 50
     if argv[1] == "--scrub-record" {
-        let rest: Vec<&String> = argv[2..].iter().filter(|a| a.as_str() != "--force").collect();
+        let rest: Vec<&String> = argv[2..].iter().filter(|a| !matches!(a.as_str(), "--force" | "--strict")).collect();
         if rest.len() != 2 {
             die("usage: e-shredder --scrub-record <drive letter>: <record number>");
         }
@@ -208,7 +211,7 @@ fn main() {
         match a.as_str() {
             "--erase" => do_erase = true,
             "--yes" => yes = true,
-            "--force" => {}
+            "--force" | "--strict" => {}
             s if s.starts_with("--") => die(&format!("unknown option {s}")),
             other => path_arg = Some(other.to_string()),
         }

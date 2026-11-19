@@ -41,7 +41,7 @@ pub fn acquire_volume(vol: &Volume, force: bool) -> Result<(), String> {
         }
         Err(e) => Err(format!(
             "{e}. Something has this drive open (an Explorer window showing it, the disk editor, \
-             a shell inside it). Close it and retry, or add --force to dismount the drive instead."
+             a shell inside it). Close it and retry, or remove --strict to dismount the drive instead."
         )),
     }
 }
@@ -133,6 +133,6 @@ fn scrub_record(
     }
     println!("  freed MFT record scrubbed and verified (no name, no data left)");
 
-    vol.dismount()?; // drop cached copies; the volume remounts on next access
+    let _ = vol.dismount(); // may already be dismounted by the --force fallback; ignore that
     Ok(())
 }
