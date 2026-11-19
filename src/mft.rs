@@ -289,3 +289,55 @@ pub fn mft_record_offset(
     }
     None
 }
+/// Zero everything after the record header of a FREE (not in use) record and put an
+/// end-of-attributes marker there, so no file name, timestamps or resident data survive.
+/// `rec` must have its fixups applied (as returned by `read_record`).
+pub fn scrub_free_record(rec: &mut [u8]) -> Result<(), String> {
+    let usa_off = u16_at(rec, 4) as usize;
+    let usa_cnt = u16_at(rec, 6) as usize;
+    let first_attr = u16_at(rec, 0x14) as usize;
+    let flags = u16_at(rec, 0x16);
+    if flags & 0x01 != 0 {
+        return Err("refusing to scrub a record that is in use".into());
+    }
+    if first_attr < 0x30
+        || first_attr % 8 != 0
+        || first_attr + 8 > rec.len()
+        || usa_off + usa_cnt * 2 > first_attr
+    {
+        return Err("unexpected record layout; not scrubbing".into());
+    }
+    rec[first_attr..].fill(0);
+    rec[first_attr..first_attr + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+    rec[0x18..0x1C].copy_from_slice(&((first_attr + 8) as u32).to_le_bytes()); // bytes in use
+    Ok(())
+}
+
+/// Inverse of `apply_fixups`: before writing a record back to disk, save the last two bytes
+/// of every 512-byte sector into the update sequence array and stamp a (new) sequence
+/// number in their place.
+pub fn protect_fixups(rec: &mut [u8]) -> Result<(), String> {
+    if rec.len() < 0x30 || &rec[0..4] != b"FILE" {
+        return Err("record does not start with 'FILE'".into());
+    }
+    let usa_off = u16_at(rec, 4) as usize;
+    let usa_cnt = u16_at(rec, 6) as usize;
+    if usa_cnt < 2 || usa_off + usa_cnt * 2 > rec.len() || (usa_cnt - 1) * 512 > rec.len() {
+        return Err("invalid update sequence array".into());
+    }
+    let mut usn = u16_at(rec, usa_off).wrapping_add(1);
+    if usn == 0 {
+        usn = 1;
+    }
+    let u = usn.to_le_bytes();
+    rec[usa_off] = u[0];
+    rec[usa_off + 1] = u[1];
+    for i in 1..usa_cnt {
+        let end = i * 512 - 2;
+        rec[usa_off + i * 2] = rec[end];
+        rec[usa_off + i * 2 + 1] = rec[end + 1];
+        rec[end] = u[0];
+        rec[end + 1] = u[1];
+    }
+    Ok(())
+}

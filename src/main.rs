@@ -1,3 +1,4 @@
+mod finish;
 mod mft;
 mod wipe;
 mod win;
@@ -7,6 +8,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 
+use finish::*;
 use mft::*;
 use wipe::*;
 use win::*;
@@ -23,37 +25,40 @@ struct Target<'a> {
     real_size: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn erase(
     vol: &Volume,
     path: &str,
     file_name: &str,
     p: &ParsedRecord,
+    rec: &[u8],
     cs: u64,
     do_erase: bool,
     yes: bool,
 ) -> Result<(), String> {
     println!("Erase plan    :");
 
-    // Collect the streams whose data lives in clusters
     let mut targets: Vec<Target> = Vec::new();
     for s in &p.streams {
         let label = if s.name.is_empty() { "(default)".to_string() } else { s.name.clone() };
         if s.flags != 0 {
             return Err(format!("stream {label} is compressed/sparse/encrypted; refusing"));
         }
+        let spec = if s.name.is_empty() { path.to_string() } else { format!("{path}:{}", s.name) };
         match &s.kind {
-            DataKind::Resident { .. } => {
-                println!("  stream {label}: resident (inside the MFT record) - handled in the next stage");
+            DataKind::Resident { record_offset, length } => {
+                // No clusters to wipe: prove the bytes in the record are the file's data,
+                // they are scrubbed from the freed record after deletion.
+                let via_fs = std::fs::read(&spec).map_err(|e| format!("cannot read '{spec}': {e}"))?;
+                if via_fs[..] != rec[*record_offset..*record_offset + *length] {
+                    return Err("MISMATCH: resident data differs from the file contents".into());
+                }
+                println!("  stream {label}: resident ({length} bytes in the MFT record) matches the file contents");
             }
             DataKind::NonResident { runs, real_size, .. } => {
-                let spec = if s.name.is_empty() { path.to_string() } else { format!("{path}:{}", s.name) };
                 targets.push(Target { label, spec, runs, real_size: *real_size });
             }
         }
-    }
-    if targets.is_empty() {
-        println!("  nothing stored in clusters; nothing to do in this stage.");
-        return Ok(());
     }
 
     // Prove the runs are right before touching anything
@@ -64,23 +69,23 @@ fn erase(
         println!("OK ({} bytes identical)", t.real_size);
     }
 
-    let total_clusters: u64 = targets.iter().flat_map(|t| t.runs.iter()).map(|r| r.clusters).sum();
-    println!(
-        "  plan: {} clusters ({} bytes), passes: {:?}",
-        total_clusters,
-        total_clusters * cs,
-        PASSES
-    );
-    for t in &targets {
-        for (i, r) in t.runs.iter().enumerate() {
-            println!(
-                "    {} run {i}: volume offset 0x{:X}, {} bytes",
-                t.label,
-                r.lcn * cs,
-                r.clusters * cs
-            );
+    if targets.is_empty() {
+        println!("  no data stored in clusters (resident data only)");
+    } else {
+        let total_clusters: u64 = targets.iter().flat_map(|t| t.runs.iter()).map(|r| r.clusters).sum();
+        println!("  plan: {} clusters ({} bytes), passes: {:?}", total_clusters, total_clusters * cs, PASSES);
+        for t in &targets {
+            for (i, r) in t.runs.iter().enumerate() {
+                println!(
+                    "    {} run {i}: volume offset 0x{:X}, {} bytes",
+                    t.label,
+                    r.lcn * cs,
+                    r.clusters * cs
+                );
+            }
         }
     }
+    println!("  then: delete via the file system, lock the volume, scrub the freed MFT record");
 
     if !do_erase {
         println!("DRY RUN - nothing was written. Add --erase to perform it.");
@@ -88,7 +93,7 @@ fn erase(
     }
 
     if !yes {
-        print!("Type ERASE to permanently destroy the data of '{file_name}': ");
+        print!("Type ERASE to permanently destroy '{file_name}': ");
         io::stdout().flush().ok();
         let mut line = String::new();
         io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
@@ -97,26 +102,43 @@ fn erase(
         }
     }
 
-    vol.lock().map_err(|e| {
-        format!(
-            "{e}. Close anything that has this drive open (Explorer windows, shells whose \
-             current directory is on it, the disk editor's volume tab) and try again."
-        )
-    })?;
-    println!("  volume locked, wiping...");
-
-    for t in &targets {
-        wipe_runs(vol, t.runs, cs, &PASSES)?;
-        verify_zeroed(vol, t.runs, cs)?;
-        println!("  stream {}: wiped and verified (all zero)", t.label);
+    if !targets.is_empty() {
+        vol.lock().map_err(|e| {
+            format!(
+                "{e}. Close anything that has this drive open (Explorer windows, shells whose \
+                 current directory is on it, the disk editor's volume tab) and try again."
+            )
+        })?;
+        println!("  volume locked, wiping...");
+        for t in &targets {
+            wipe_runs(vol, t.runs, cs, &PASSES)?;
+            verify_zeroed(vol, t.runs, cs)?;
+            println!("  stream {}: wiped and verified (all zero)", t.label);
+        }
+        vol.dismount()?; // forget cached file data; the volume remounts on next access
     }
-
-    vol.dismount()?; // forget cached data; the volume remounts on next access
-    println!("Done. Data clusters are wiped. (The file entry itself still exists: next stage.)");
     Ok(())
 }
 
 fn main() {
+
+        // Cleanup mode: e-shredder --scrub-record X: 50
+    let argv: Vec<String> = env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--scrub-record") {
+        if argv.len() != 4 {
+            die("usage: e-shredder --scrub-record <drive letter>: <record number>");
+        }
+        let drive = argv[2].chars().next().unwrap_or('?').to_ascii_uppercase();
+        if !drive.is_ascii_alphabetic() {
+            die("invalid drive letter");
+        }
+        let n: u64 = argv[3].parse().unwrap_or_else(|_| die("record number must be a decimal number"));
+        if let Err(e) = scrub_by_number(drive, n) {
+            die(&e);
+        }
+        println!("Done.");
+        return;
+    }
     // 1. Read the file path (and flags) from the command line
     let mut path_arg: Option<String> = None;
     let mut do_erase = false;
@@ -229,8 +251,17 @@ fn main() {
         }
     }
 
-    // Stage 3: verify + erase the data clusters
-    if let Err(e) = erase(&vol, &plain, &file_name, &p, cs, do_erase, yes) {
+    // Stage 3: verify, then wipe the data clusters
+    if let Err(e) = erase(&vol, &plain, &file_name, &p, &rec, cs, do_erase, yes) {
         die(&e);
+    }
+
+    // Stage 4: delete through NTFS, then scrub the freed MFT record
+    if do_erase {
+        drop(vol); // release the (dismounted) volume handle before using the file system again
+        if let Err(e) = delete_and_scrub(drive, &plain, rec_off, record_number, b.record_size as usize) {
+            die(&e);
+        }
+        println!("Done. '{file_name}' is wiped and deleted.");
     }
 }
