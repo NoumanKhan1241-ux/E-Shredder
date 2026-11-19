@@ -17,26 +17,39 @@ fn delete_with_retry(path: &str) -> Result<(), String> {
     Err(format!("could not delete '{path}': {last}"))
 }
 
-fn lock_with_retry(vol: &Volume) -> Result<(), String> {
+fn lock_with_retry(vol: &Volume, attempts: u32) -> Result<(), String> {
     let mut last = String::new();
-    for _ in 0..10 {
+    for _ in 0..attempts {
         match vol.lock() {
             Ok(()) => return Ok(()),
             Err(e) => last = e,
         }
         sleep(Duration::from_millis(500));
     }
-    Err(format!(
-        "{last}. Something has this drive open: close the disk editor, Explorer windows on it, \
-         and any shell whose current directory is on it, then retry"
-    ))
+    Err(last)
 }
 
-/// Make sure the volume can be locked BEFORE we delete anything.
-fn preflight_lock(drive: char) -> Result<(), String> {
+/// Get exclusive control of the volume for raw writes: lock it. If that fails and `force`
+/// is set, dismount it instead (programs with files open on it lose their handles).
+pub fn acquire_volume(vol: &Volume, force: bool) -> Result<(), String> {
+    match lock_with_retry(vol, if force { 2 } else { 10 }) {
+        Ok(()) => Ok(()),
+        Err(e) if force => {
+            println!("  lock failed ({e})");
+            println!("  --force: dismounting the volume instead; open files on this drive lose their handles");
+            vol.dismount()
+        }
+        Err(e) => Err(format!(
+            "{e}. Something has this drive open (an Explorer window showing it, the disk editor, \
+             a shell inside it). Close it and retry, or add --force to dismount the drive instead."
+        )),
+    }
+}
+
+/// Make sure we can take the volume BEFORE we delete anything.
+fn preflight(drive: char, force: bool) -> Result<(), String> {
     let vol = Volume::open(drive, true)?;
-    lock_with_retry(&vol)?;
-    Ok(()) // dropping the handle releases the lock
+    acquire_volume(&vol, force) // dropping the handle releases the lock
 }
 
 /// Remove the (already wiped) file through NTFS, then scrub what NTFS leaves in the freed record.
@@ -46,13 +59,14 @@ pub fn delete_and_scrub(
     rec_off: u64,
     record_number: u64,
     record_size: usize,
+    force: bool,
 ) -> Result<(), String> {
     println!("Finishing     :");
-    preflight_lock(drive)?;
+    preflight(drive, force)?;
     delete_with_retry(path)?;
     println!("  file deleted through the file system (not moved to the Recycle Bin)");
 
-    scrub_record(drive, rec_off, record_number, record_size).map_err(|e| {
+    scrub_record(drive, rec_off, record_number, record_size, force).map_err(|e| {
         format!(
             "{e}\n  The file is deleted and its data wiped, but the freed MFT record was NOT scrubbed.\n  \
              Fix the problem, then run:  e-shredder --scrub-record {drive}: {record_number}"
@@ -61,7 +75,7 @@ pub fn delete_and_scrub(
 }
 
 /// Cleanup mode: scrub an already-freed MFT record, addressed by number.
-pub fn scrub_by_number(drive: char, record_number: u64) -> Result<(), String> {
+pub fn scrub_by_number(drive: char, record_number: u64, force: bool) -> Result<(), String> {
     if record_number < 24 {
         return Err("refusing: records below 24 are NTFS system files".into());
     }
@@ -73,12 +87,18 @@ pub fn scrub_by_number(drive: char, record_number: u64) -> Result<(), String> {
     let rec_off = mft_record_offset(&mft_runs, b.cluster_size as u64, b.record_size as u64, record_number)
         .ok_or("record number lies outside the MFT")?;
     drop(vol);
-    scrub_record(drive, rec_off, record_number, b.record_size as usize)
+    scrub_record(drive, rec_off, record_number, b.record_size as usize, force)
 }
 
-fn scrub_record(drive: char, rec_off: u64, record_number: u64, record_size: usize) -> Result<(), String> {
+fn scrub_record(
+    drive: char,
+    rec_off: u64,
+    record_number: u64,
+    record_size: usize,
+    force: bool,
+) -> Result<(), String> {
     let vol = Volume::open(drive, true)?;
-    lock_with_retry(&vol)?;
+    acquire_volume(&vol, force)?;
     vol.flush()?; // make sure NTFS's own pending changes are on disk before we look
 
     let mut rec = read_record(&vol, rec_off, record_size)?;

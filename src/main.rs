@@ -1,5 +1,6 @@
 mod finish;
 mod mft;
+mod shell;
 mod wipe;
 mod win;
 
@@ -7,14 +8,29 @@ use std::env;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use finish::*;
 use mft::*;
+use shell::*;
 use wipe::*;
 use win::*;
 
+/// Set when launched from the context menu: the console closes on exit, so wait for Enter.
+static PAUSE: AtomicBool = AtomicBool::new(false);
+
+fn pause() {
+    if PAUSE.load(Ordering::Relaxed) {
+        print!("\nPress Enter to close this window...");
+        io::stdout().flush().ok();
+        let mut s = String::new();
+        io::stdin().read_line(&mut s).ok();
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("Error: {msg}");
+    pause();
     process::exit(1);
 }
 
@@ -35,6 +51,7 @@ fn erase(
     cs: u64,
     do_erase: bool,
     yes: bool,
+    force: bool,
 ) -> Result<(), String> {
     println!("Erase plan    :");
 
@@ -47,8 +64,6 @@ fn erase(
         let spec = if s.name.is_empty() { path.to_string() } else { format!("{path}:{}", s.name) };
         match &s.kind {
             DataKind::Resident { record_offset, length } => {
-                // No clusters to wipe: prove the bytes in the record are the file's data,
-                // they are scrubbed from the freed record after deletion.
                 let via_fs = std::fs::read(&spec).map_err(|e| format!("cannot read '{spec}': {e}"))?;
                 if via_fs[..] != rec[*record_offset..*record_offset + *length] {
                     return Err("MISMATCH: resident data differs from the file contents".into());
@@ -61,7 +76,6 @@ fn erase(
         }
     }
 
-    // Prove the runs are right before touching anything
     for t in &targets {
         print!("  verifying stream {} against the raw clusters ... ", t.label);
         io::stdout().flush().ok();
@@ -103,13 +117,8 @@ fn erase(
     }
 
     if !targets.is_empty() {
-        vol.lock().map_err(|e| {
-            format!(
-                "{e}. Close anything that has this drive open (Explorer windows, shells whose \
-                 current directory is on it, the disk editor's volume tab) and try again."
-            )
-        })?;
-        println!("  volume locked, wiping...");
+        acquire_volume(vol, force)?;
+        println!("  volume secured, wiping...");
         for t in &targets {
             wipe_runs(vol, t.runs, cs, &PASSES)?;
             verify_zeroed(vol, t.runs, cs)?;
@@ -121,40 +130,90 @@ fn erase(
 }
 
 fn main() {
+    let raw: Vec<String> = env::args().collect();
+    let pause_flag = raw.iter().any(|a| a == "--pause");
+    let argv: Vec<String> = raw.into_iter().filter(|a| a != "--pause").collect();
+    let force = argv.iter().any(|a| a == "--force");
 
-        // Cleanup mode: e-shredder --scrub-record X: 50
-    let argv: Vec<String> = env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("--scrub-record") {
-        if argv.len() != 4 {
+    if argv.len() < 2 {
+        eprintln!(
+            "Usage:\n  e-shredder <file> [--erase] [--yes] [--force]\n  \
+             e-shredder --install [--force] | --uninstall\n  \
+             e-shredder --scrub-record <drive>: <record number> [--force]"
+        );
+        process::exit(1);
+    }
+
+    // Context-menu registration: per-user registry, no elevation needed
+    match argv[1].as_str() {
+        "--install" => {
+            match install(force) {
+                Ok(cmd) => println!(
+                    "Context menu entry installed.\nCommand: {cmd}\n\
+                     Right-click a file (Windows 11: 'Show more options', or Shift+right-click)."
+                ),
+                Err(e) => die(&e),
+            }
+            return;
+        }
+        "--uninstall" => {
+            match uninstall() {
+                Ok(true) => println!("Context menu entry removed."),
+                Ok(false) => println!("Context menu entry was not installed."),
+                Err(e) => die(&e),
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Everything below needs Administrator rights (raw volume access): relaunch if needed
+    if !is_elevated() {
+        let mut child: Vec<String> = argv[1..].to_vec();
+        child.push("--pause".into());
+        match relaunch_elevated(&child) {
+            Ok(()) => println!("Relaunched with Administrator rights in a new window."),
+            Err(e) => die(&e),
+        }
+        return;
+    }
+    if pause_flag {
+        PAUSE.store(true, Ordering::Relaxed);
+    }
+
+    // Cleanup mode: e-shredder --scrub-record X: 50
+    if argv[1] == "--scrub-record" {
+        let rest: Vec<&String> = argv[2..].iter().filter(|a| a.as_str() != "--force").collect();
+        if rest.len() != 2 {
             die("usage: e-shredder --scrub-record <drive letter>: <record number>");
         }
-        let drive = argv[2].chars().next().unwrap_or('?').to_ascii_uppercase();
+        let drive = rest[0].chars().next().unwrap_or('?').to_ascii_uppercase();
         if !drive.is_ascii_alphabetic() {
             die("invalid drive letter");
         }
-        let n: u64 = argv[3].parse().unwrap_or_else(|_| die("record number must be a decimal number"));
-        if let Err(e) = scrub_by_number(drive, n) {
+        let n: u64 = rest[1].parse().unwrap_or_else(|_| die("record number must be a decimal number"));
+        if let Err(e) = scrub_by_number(drive, n, force) {
             die(&e);
         }
         println!("Done.");
+        pause();
         return;
     }
+
     // 1. Read the file path (and flags) from the command line
     let mut path_arg: Option<String> = None;
     let mut do_erase = false;
     let mut yes = false;
-    for a in env::args().skip(1) {
+    for a in argv.iter().skip(1) {
         match a.as_str() {
             "--erase" => do_erase = true,
             "--yes" => yes = true,
+            "--force" => {}
             s if s.starts_with("--") => die(&format!("unknown option {s}")),
             other => path_arg = Some(other.to_string()),
         }
     }
-    let path_arg = path_arg.unwrap_or_else(|| {
-        eprintln!("Usage: e-shredder <file path> [--erase] [--yes]");
-        process::exit(1);
-    });
+    let path_arg = path_arg.unwrap_or_else(|| die("no file path given"));
 
     // 2. Check that the file exists
     let path = Path::new(&path_arg);
@@ -178,7 +237,7 @@ fn main() {
     println!("MFT record    : {record_number} (0x{record_number:X}), sequence {sequence}");
 
     // Step 2: open the volume (read+write only when erasing), boot sector, MFT
-    let vol = Volume::open(drive, do_erase).unwrap_or_else(|e| die(&format!("{e}. Run as Administrator.")));
+    let vol = Volume::open(drive, do_erase).unwrap_or_else(|e| die(&e));
     let mut boot = [0u8; 512];
     vol.read_at(0, &mut boot).unwrap_or_else(|e| die(&e));
     let b = parse_boot_sector(&boot).unwrap_or_else(|e| die(&e));
@@ -252,16 +311,17 @@ fn main() {
     }
 
     // Stage 3: verify, then wipe the data clusters
-    if let Err(e) = erase(&vol, &plain, &file_name, &p, &rec, cs, do_erase, yes) {
+    if let Err(e) = erase(&vol, &plain, &file_name, &p, &rec, cs, do_erase, yes, force) {
         die(&e);
     }
 
     // Stage 4: delete through NTFS, then scrub the freed MFT record
     if do_erase {
         drop(vol); // release the (dismounted) volume handle before using the file system again
-        if let Err(e) = delete_and_scrub(drive, &plain, rec_off, record_number, b.record_size as usize) {
+        if let Err(e) = delete_and_scrub(drive, &plain, rec_off, record_number, b.record_size as usize, force) {
             die(&e);
         }
         println!("Done. '{file_name}' is wiped and deleted.");
     }
+    pause();
 }
