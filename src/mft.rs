@@ -1,26 +1,36 @@
+
 use crate::win::Volume;
 
 pub const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 pub const ATTR_FILE_NAME: u32 = 0x30;
+
 pub const ATTR_DATA: u32 = 0x80;
+
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
-// ---------- little-endian helpers ----------
+
+/// Read a 16-bit little-endian unsigned number from `b` at offset `o`.
 fn u16_at(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
+/// Read a 32-bit little-endian unsigned number from `b` at offset `o`.
+/// (`try_into` converts the 4-byte slice into the fixed-size array `from_le_bytes` needs.)
 fn u32_at(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
+/// Read a 64-bit little-endian unsigned number from `b` at offset `o`.
 fn u64_at(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) }
+/// Decode UTF-16LE bytes (how NTFS stores file and stream names) into a Rust `String`.
 fn utf16(b: &[u8]) -> String {
+    // Group the bytes in pairs and turn every pair into one 16-bit character.
     let v: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    // `lossy`: invalid sequences become a replacement character instead of failing.
     String::from_utf16_lossy(&v)
 }
 
-// ---------- boot sector ----------
 pub struct BootInfo {
     pub bytes_per_sector: u32,
     pub cluster_size: u32,
     pub record_size: u32,
     pub mft_cluster: u64,
 }
+
 
 pub fn parse_boot_sector(s: &[u8]) -> Result<BootInfo, String> {
     if &s[3..11] != b"NTFS    " {
@@ -29,13 +39,13 @@ pub fn parse_boot_sector(s: &[u8]) -> Result<BootInfo, String> {
     let bytes_per_sector = u16_at(s, 0x0B) as u32;
     let cluster_size = bytes_per_sector * s[0x0D] as u32;
     let mft_cluster = u64_at(s, 0x30);
-    // Positive = clusters per record; negative = record size is 2^(-n) bytes.
     let raw = s[0x40] as i8;
     let record_size = if raw > 0 { raw as u32 * cluster_size } else { 1u32 << (-(raw as i32)) };
     Ok(BootInfo { bytes_per_sector, cluster_size, record_size, mft_cluster })
 }
 
-// ---------- data runs ----------
+
+/// One contiguous piece of a file's data on the volume.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub lcn: u64,      // start cluster on the volume (meaningless if sparse)
@@ -43,41 +53,50 @@ pub struct Run {
     pub sparse: bool,  // hole: no clusters are actually allocated
 }
 
-/// Decode an NTFS run list. Each run: header byte (high nibble = size of the offset
-/// field, low nibble = size of the length field), then length, then a SIGNED offset
-/// that is relative to the previous run's start cluster. A 0x00 header ends the list.
+
+/// The offsets are *relative* (each is added to the previous run's start) and *signed*, so a
+/// later fragment may lie before an earlier one on the disk, as in the example. Getting this
+/// sign wrong is the classic bug, which is why the sign extension below exists.
 pub fn decode_runs(data: &[u8]) -> Result<Vec<Run>, String> {
     let mut runs = Vec::new();
     let mut pos = 0usize;
+    // Signed (i64) because the deltas can be negative.
     let mut lcn: i64 = 0;
 
     while pos < data.len() {
+        // The header byte describes the sizes of the two fields that follow.
         let header = data[pos];
+        // A zero header byte is the terminator of the run list.
         if header == 0 {
             break;
         }
         pos += 1;
         let len_size = (header & 0x0F) as usize;
         let off_size = (header >> 4) as usize;
+    
         if len_size == 0 || len_size > 8 || off_size > 8 || pos + len_size + off_size > data.len() {
             return Err(format!("corrupt run list (header 0x{header:02X})"));
         }
 
+        // Read the length field (little-endian, variable width) byte by byte.
         let mut clusters: u64 = 0;
         for i in 0..len_size {
             clusters |= (data[pos + i] as u64) << (8 * i);
         }
         pos += len_size;
 
+        // An offset size of 0 means "no clusters are stored": a sparse run (a hole).
         if off_size == 0 {
             runs.push(Run { lcn: 0, clusters, sparse: true });
             continue;
         }
 
+        // Read the offset field (little-endian, variable width) into a signed number.
         let mut delta: i64 = 0;
         for i in 0..off_size {
             delta |= (data[pos + i] as i64) << (8 * i);
         }
+       
         if off_size < 8 && data[pos + off_size - 1] & 0x80 != 0 {
             delta |= -1i64 << (8 * off_size); // sign-extend
         }
@@ -92,10 +111,9 @@ pub fn decode_runs(data: &[u8]) -> Result<Vec<Run>, String> {
     Ok(runs)
 }
 
-// ---------- MFT record ----------
-/// An MFT record stores, at the end of every 512-byte sector, a copy of a "sequence
-/// number" instead of the real last two bytes. The real bytes live in the update
-/// sequence array. We must restore them before parsing anything.
+
+/// Modifies `rec` in place; returns an error if the record is not a valid `FILE` record or if
+/// a sector's check value does not match (torn or corrupt record).
 pub fn apply_fixups(rec: &mut [u8]) -> Result<(), String> {
     if rec.len() < 0x30 || &rec[0..4] != b"FILE" {
         return Err("record does not start with 'FILE'".into());
@@ -107,20 +125,24 @@ pub fn apply_fixups(rec: &mut [u8]) -> Result<(), String> {
     }
     let usn = [rec[usa_off], rec[usa_off + 1]];
     for i in 1..usa_cnt {
+        
         let end = i * 512 - 2;
+        // The check value stored there must equal the USN, otherwise the write was torn.
         if rec[end..end + 2] != usn {
             return Err(format!("fixup mismatch in sector {i} (torn or corrupt record)"));
         }
+        // Put the real bytes (saved in the USA) back where they belong.
         rec[end] = rec[usa_off + i * 2];
         rec[end + 1] = rec[usa_off + i * 2 + 1];
     }
     Ok(())
 }
 
+/// Where the data of one stream lives.
 pub enum DataKind {
-    /// Data stored inside the MFT record itself (small files).
+    
     Resident { record_offset: usize, length: usize },
-    /// Data stored in clusters elsewhere on the volume.
+    
     NonResident { runs: Vec<Run>, real_size: u64, allocated_size: u64 },
 }
 
@@ -131,6 +153,7 @@ pub struct DataStream {
 }
 
 pub struct ParsedRecord {
+    
     pub record_number: u32,
     pub sequence: u16,
     pub in_use: bool,
@@ -141,8 +164,13 @@ pub struct ParsedRecord {
     pub has_attribute_list: bool,
 }
 
-/// Parse a record whose fixups were already applied.
+
+/// Each attribute starts with a header: `0x00` type (u32), `0x04` total length (u32),
+/// `0x08` non-resident flag (u8), `0x09` name length in characters (u8), `0x0A` name offset
+/// (u16), `0x0C` flags (u16). After that the layout differs for resident and non-resident
+/// attributes (see the code).
 pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
+    // Read the header fields we need (offsets are given in the doc comment above).
     let sequence = u16_at(rec, 0x10);
     let hard_links = u16_at(rec, 0x12);
     let first_attr = u16_at(rec, 0x14) as usize;
@@ -154,10 +182,12 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
     if base_ref != 0 {
         return Err("this is an extension record, not a base record".into());
     }
+   
     if used > rec.len() || first_attr + 8 > used {
         return Err("invalid record header".into());
     }
 
+    // Build the result with the header information; the lists are filled in the loop below.
     let mut out = ParsedRecord {
         record_number,
         sequence,
@@ -169,6 +199,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
         has_attribute_list: false,
     };
 
+    // `pos` is the offset of the attribute currently being examined.
     let mut pos = first_attr;
     while pos + 8 <= used {
         let atype = u32_at(rec, pos);
@@ -176,6 +207,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
             break;
         }
         let alen = u32_at(rec, pos + 4) as usize;
+       
         if alen < 0x18 || alen % 8 != 0 || pos + alen > used {
             return Err(format!("invalid attribute length {alen} at record offset 0x{pos:X}"));
         }
@@ -196,6 +228,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
         match atype {
             ATTR_ATTRIBUTE_LIST => out.has_attribute_list = true,
 
+            
             ATTR_FILE_NAME if !non_resident => {
                 let clen = u32_at(attr, 0x10) as usize;
                 let coff = u16_at(attr, 0x14) as usize;
@@ -210,6 +243,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
                 out.file_names.push(utf16(&c[0x42..0x42 + nlen * 2]));
             }
 
+            // The file contents (or the run list that points to them).
             ATTR_DATA => {
                 let kind = if !non_resident {
                     let clen = u32_at(attr, 0x10) as usize;
@@ -217,6 +251,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
                     if coff + clen > alen {
                         return Err("resident data outside attribute".into());
                     }
+                    
                     DataKind::Resident { record_offset: pos + coff, length: clen }
                 } else {
                     if alen < 0x40 {
@@ -227,6 +262,7 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
                         return Err("run list offset outside attribute".into());
                     }
                     DataKind::NonResident {
+                       
                         runs: decode_runs(&attr[run_off..])?,
                         allocated_size: u64_at(attr, 0x28),
                         real_size: u64_at(attr, 0x30),
@@ -236,21 +272,27 @@ pub fn parse_record(rec: &[u8]) -> Result<ParsedRecord, String> {
             }
             _ => {}
         }
+        // Jump to the next attribute: attributes are stored back to back.
         pos += alen;
     }
     Ok(out)
 }
 
-// ---------- reading records from the volume ----------
+
+/// Combines the read with `apply_fixups` so that every caller receives a buffer in which the
+/// real bytes are back in place.
 pub fn read_record(vol: &Volume, offset: u64, record_size: usize) -> Result<Vec<u8>, String> {
+    // A zero-filled buffer of exactly one record, filled by the raw read.
     let mut rec = vec![0u8; record_size];
     vol.read_at(offset, &mut rec)?;
     apply_fixups(&mut rec)?;
     Ok(rec)
 }
 
-/// The MFT is itself a file (record 0, "$MFT") and can be fragmented, so we read
-/// ITS data runs and use them to find any record.
+
+/// Why this extra step: the boot sector only gives the *start* of the MFT. If the MFT has
+/// grown in several pieces, record number 5000 might not be at `start + 5000 * 1024`. Record 0
+/// always lies at the start and describes the pieces, so we read it first.
 pub fn load_mft_runs(vol: &Volume, boot: &BootInfo) -> Result<Vec<Run>, String> {
     let off = boot.mft_cluster * boot.cluster_size as u64;
     let rec = read_record(vol, off, boot.record_size as usize)?;
@@ -269,7 +311,7 @@ pub fn load_mft_runs(vol: &Volume, boot: &BootInfo) -> Result<Vec<Run>, String> 
     }
 }
 
-/// Byte offset on the volume of MFT record `record_number`.
+
 pub fn mft_record_offset(
     mft_runs: &[Run],
     cluster_size: u64,
@@ -282,6 +324,7 @@ pub fn mft_record_offset(
             return None;
         }
         let run_bytes = r.clusters * cluster_size;
+       
         if pos < run_bytes {
             return Some(r.lcn * cluster_size + pos);
         }
@@ -289,9 +332,12 @@ pub fn mft_record_offset(
     }
     None
 }
-/// Zero everything after the record header of a FREE (not in use) record and put an
-/// end-of-attributes marker there, so no file name, timestamps or resident data survive.
-/// `rec` must have its fixups applied (as returned by `read_record`).
+
+
+/// Used after NTFS has deleted the file: NTFS only clears the "in use" flag and leaves the
+/// old name and resident data inside the record. This function removes those leftovers.
+/// The header (including the update sequence array) is kept so the record stays valid and
+/// can be reused by NTFS later.
 pub fn scrub_free_record(rec: &mut [u8]) -> Result<(), String> {
     let usa_off = u16_at(rec, 4) as usize;
     let usa_cnt = u16_at(rec, 6) as usize;
@@ -300,6 +346,7 @@ pub fn scrub_free_record(rec: &mut [u8]) -> Result<(), String> {
     if flags & 0x01 != 0 {
         return Err("refusing to scrub a record that is in use".into());
     }
+    
     if first_attr < 0x30
         || first_attr % 8 != 0
         || first_attr + 8 > rec.len()
@@ -307,15 +354,17 @@ pub fn scrub_free_record(rec: &mut [u8]) -> Result<(), String> {
     {
         return Err("unexpected record layout; not scrubbing".into());
     }
+    
     rec[first_attr..].fill(0);
     rec[first_attr..first_attr + 4].copy_from_slice(&ATTR_END.to_le_bytes());
     rec[0x18..0x1C].copy_from_slice(&((first_attr + 8) as u32).to_le_bytes()); // bytes in use
     Ok(())
 }
 
-/// Inverse of `apply_fixups`: before writing a record back to disk, save the last two bytes
-/// of every 512-byte sector into the update sequence array and stamp a (new) sequence
-/// number in their place.
+
+/// A record read with `read_record` has its fixups *removed*. NTFS expects the on-disk form,
+/// so after modifying a record this function must run before `Volume::write_at`; otherwise
+/// NTFS would consider the record corrupt.
 pub fn protect_fixups(rec: &mut [u8]) -> Result<(), String> {
     if rec.len() < 0x30 || &rec[0..4] != b"FILE" {
         return Err("record does not start with 'FILE'".into());
@@ -325,6 +374,7 @@ pub fn protect_fixups(rec: &mut [u8]) -> Result<(), String> {
     if usa_cnt < 2 || usa_off + usa_cnt * 2 > rec.len() || (usa_cnt - 1) * 512 > rec.len() {
         return Err("invalid update sequence array".into());
     }
+   
     let mut usn = u16_at(rec, usa_off).wrapping_add(1);
     if usn == 0 {
         usn = 1;
